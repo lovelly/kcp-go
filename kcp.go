@@ -33,13 +33,13 @@ const (
 // Output is a closure which captures conn and calls conn.Write
 type Output func(buf []byte, size int)
 
-/* encode 8 bits unsigned int */
+/* encode 8 bits unsigned int */ //写入8个字节 下标后移
 func ikcp_encode8u(p []byte, c byte) []byte {
 	p[0] = c
 	return p[1:]
 }
 
-/* decode 8 bits unsigned int */
+/* decode 8 bits unsigned int */ //读取8个字节， 下标后移
 func ikcp_decode8u(p []byte, c *byte) []byte {
 	*c = p[0]
 	return p[1:]
@@ -137,9 +137,9 @@ type KCP struct {
 	fastresend     int32
 	nocwnd, stream int32
 
-	snd_queue []Segment
+	snd_queue []Segment  //待发送队列
 	rcv_queue []Segment
-	snd_buf   []Segment
+	snd_buf   []Segment //真正发送的队列 可以理解为滑动串口
 	rcv_buf   []Segment
 
 	acklist []ackItem
@@ -157,7 +157,7 @@ type ackItem struct {
 // from the same connection.
 func NewKCP(conv uint32, output Output) *KCP {
 	kcp := new(KCP)
-	kcp.conv = conv
+	kcp.conv = conv  //conv为一个表示会话编号的整数
 	kcp.snd_wnd = IKCP_WND_SND
 	kcp.rcv_wnd = IKCP_WND_RCV
 	kcp.rmt_wnd = IKCP_WND_RCV
@@ -186,13 +186,14 @@ func (kcp *KCP) delSegment(seg Segment) {
 }
 
 // PeekSize checks the size of next message in the recv queue
+//获取要读取的数据长度， 非流模式要读完， 为了重组分片
 func (kcp *KCP) PeekSize() (length int) {
 	if len(kcp.rcv_queue) == 0 {
 		return -1
 	}
 
 	seg := &kcp.rcv_queue[0]
-	if seg.frg == 0 {
+	if seg.frg == 0 { // 流模式。返回一个片的长度
 		return len(seg.data)
 	}
 
@@ -200,7 +201,7 @@ func (kcp *KCP) PeekSize() (length int) {
 		return -1
 	}
 
-	for k := range kcp.rcv_queue {
+	for k := range kcp.rcv_queue { //返回完整数据长度
 		seg := &kcp.rcv_queue[k]
 		length += len(seg.data)
 		if seg.frg == 0 {
@@ -211,7 +212,7 @@ func (kcp *KCP) PeekSize() (length int) {
 }
 
 // Recv is user/upper level recv: returns size, returns below zero for EAGAIN
-func (kcp *KCP) Recv(buffer []byte) (n int) {
+func (kcp *KCP) Recv(buffer []byte) (n int) { //从 rcv_queue数组中读取数据， rcv_queue的数据在parse_data中放入
 	if len(kcp.rcv_queue) == 0 {
 		return -1
 	}
@@ -221,7 +222,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		return -2
 	}
 
-	if peeksize > len(buffer) {
+	if peeksize > len(buffer) { //buff 太小。
 		return -3
 	}
 
@@ -239,7 +240,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		n += len(seg.data)
 		count++
 		kcp.delSegment(*seg)
-		if seg.frg == 0 {
+		if seg.frg == 0 {//流模式一个片一个片的读
 			break
 		}
 	}
@@ -251,7 +252,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	count = 0
 	for k := range kcp.rcv_buf {
 		seg := &kcp.rcv_buf[k]
-		if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue) < int(kcp.rcv_wnd) {
+		if seg.sn == kcp.rcv_nxt && len(kcp.rcv_queue) < int(kcp.rcv_wnd) { //发来的包是期待的包， 且 接受窗口没满， 增加期望接受的序号
 			kcp.rcv_nxt++
 			count++
 		} else {
@@ -259,12 +260,12 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		}
 	}
 
-	if count > 0 {
+	if count > 0 { //把可以接受的包放进 rcv_queue
 		kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
 		kcp.rcv_buf = kcp.remove_front(kcp.rcv_buf, count)
 	}
 
-	// fast recover
+	// fast recover ？？？？
 	if len(kcp.rcv_queue) < int(kcp.rcv_wnd) && fast_recover {
 		// ready to send back IKCP_CMD_WINS in ikcp_flush
 		// tell remote my window size
@@ -281,7 +282,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 	}
 
 	// append to previous segment in streaming mode (if possible)
-	if kcp.stream != 0 {
+	if kcp.stream != 0 { //流模式 最后一个片如果没满， 填充满最后一个片
 		n := len(kcp.snd_queue)
 		if n > 0 {
 			seg := &kcp.snd_queue[n-1]
@@ -301,7 +302,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 			}
 		}
 
-		if len(buffer) == 0 {
+		if len(buffer) == 0 { //包全塞完了。
 			return 0
 		}
 	}
@@ -309,10 +310,10 @@ func (kcp *KCP) Send(buffer []byte) int {
 	if len(buffer) <= int(kcp.mss) {
 		count = 1
 	} else {
-		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)
+		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss) //向下取整， 最少一个片
 	}
 
-	if count > 255 {
+	if count > 255 {  // 默认mss = 1460 ///   * 255  包太大了
 		return -2
 	}
 
@@ -320,7 +321,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		count = 1
 	}
 
-	for i := 0; i < count; i++ {
+	for i := 0; i < count; i++ { //分片
 		var size int
 		if len(buffer) > int(kcp.mss) {
 			size = int(kcp.mss)
@@ -334,7 +335,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		} else { // stream mode
 			seg.frg = 0
 		}
-		kcp.snd_queue = append(kcp.snd_queue, seg)
+		kcp.snd_queue = append(kcp.snd_queue, seg) //把片追加进 snd_queue 就好 在kcp.flush 中发送出去
 		buffer = buffer[size:]
 	}
 	return 0
@@ -365,6 +366,7 @@ func (kcp *KCP) update_ack(rtt int32) {
 	kcp.rx_rto = _ibound_(kcp.rx_minrto, rto, IKCP_RTO_MAX)
 }
 
+//下一个要发送的序号
 func (kcp *KCP) shrink_buf() {
 	if len(kcp.snd_buf) > 0 {
 		seg := &kcp.snd_buf[0]
@@ -374,7 +376,7 @@ func (kcp *KCP) shrink_buf() {
 	}
 }
 
-func (kcp *KCP) parse_ack(sn uint32) {
+func (kcp *KCP) parse_ack(sn uint32) { // 对方的收到的确定序号
 	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return
 	}
@@ -383,12 +385,12 @@ func (kcp *KCP) parse_ack(sn uint32) {
 		seg := &kcp.snd_buf[k]
 		if sn == seg.sn {
 			kcp.delSegment(*seg)
-			copy(kcp.snd_buf[k:], kcp.snd_buf[k+1:])
-			kcp.snd_buf[len(kcp.snd_buf)-1] = Segment{}
-			kcp.snd_buf = kcp.snd_buf[:len(kcp.snd_buf)-1]
+			copy(kcp.snd_buf[k:], kcp.snd_buf[k+1:]) //删除确认的这一个
+			kcp.snd_buf[len(kcp.snd_buf)-1] = Segment{}  //补充个空的？？？？？
+			kcp.snd_buf = kcp.snd_buf[:len(kcp.snd_buf)-1] //删除最后一个。。。
 			break
 		}
-		if _itimediff(sn, seg.sn) < 0 {
+		if _itimediff(sn, seg.sn) < 0 { //对方确定收到的序号，要比当前要发送的序号大
 			break
 		}
 	}
@@ -409,11 +411,11 @@ func (kcp *KCP) parse_fastack(sn uint32) {
 	}
 }
 
-func (kcp *KCP) parse_una(una uint32) {
+func (kcp *KCP) parse_una(una uint32) { //una = ack ???
 	count := 0
 	for k := range kcp.snd_buf {
 		seg := &kcp.snd_buf[k]
-		if _itimediff(una, seg.sn) > 0 {
+		if _itimediff(una, seg.sn) > 0 { // una > seg.sn  发送队列中删除比对方期望收到的字节小的元素。
 			kcp.delSegment(*seg)
 			count++
 		} else {
@@ -430,6 +432,7 @@ func (kcp *KCP) ack_push(sn, ts uint32) {
 	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})
 }
 
+//把数据从窗口读到缓冲队列
 func (kcp *KCP) parse_data(newseg Segment) {
 	sn := newseg.sn
 	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 ||
@@ -485,7 +488,7 @@ func (kcp *KCP) parse_data(newseg Segment) {
 
 // Input when you received a low level packet (eg. UDP packet), call it
 // regular indicates a regular packet has received(not from FEC)
-func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
+func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int { //kcp 数据打包
 	una := kcp.snd_una
 	if len(data) < IKCP_OVERHEAD {
 		return -1
@@ -510,13 +513,13 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			return -1
 		}
 
-		data = ikcp_decode8u(data, &cmd)
-		data = ikcp_decode8u(data, &frg)
-		data = ikcp_decode16u(data, &wnd)
-		data = ikcp_decode32u(data, &ts)
-		data = ikcp_decode32u(data, &sn)
-		data = ikcp_decode32u(data, &una)
-		data = ikcp_decode32u(data, &length)
+		data = ikcp_decode8u(data, &cmd)  //操作
+		data = ikcp_decode8u(data, &frg)  //模式
+		data = ikcp_decode16u(data, &wnd) //写窗口
+		data = ikcp_decode32u(data, &ts)  //延迟？
+		data = ikcp_decode32u(data, &sn)   //
+		data = ikcp_decode32u(data, &una)  //到这个序号钱的包都收到了
+		data = ikcp_decode32u(data, &length) //数据长度
 		if len(data) < int(length) {
 			return -2
 		}
@@ -616,6 +619,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	return 0
 }
 
+//返回还能接收的多少个片
 func (kcp *KCP) wnd_unused() uint16 {
 	if len(kcp.rcv_queue) < int(kcp.rcv_wnd) {
 		return uint16(int(kcp.rcv_wnd) - len(kcp.rcv_queue))
@@ -623,13 +627,13 @@ func (kcp *KCP) wnd_unused() uint16 {
 	return 0
 }
 
-// flush pending data
+// flush pending data 真正的发送数据出去
 func (kcp *KCP) flush(ackOnly bool) {
 	var seg Segment
-	seg.conv = kcp.conv
+	seg.conv = kcp.conv  //conv为一个表示会话编号的整数
 	seg.cmd = IKCP_CMD_ACK
-	seg.wnd = kcp.wnd_unused()
-	seg.una = kcp.rcv_nxt
+	seg.wnd = kcp.wnd_unused() //已经还能接收的片的大小
+	seg.una = kcp.rcv_nxt //下一个想要收到的第一个数据的字节编号
 
 	buffer := kcp.buffer
 	// flush acknowledges
