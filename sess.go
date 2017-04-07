@@ -1,7 +1,6 @@
 package kcp
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"hash/crc32"
@@ -41,6 +40,9 @@ const (
 
 	// accept backlog
 	acceptBacklog = 128
+
+	// prerouting(to session) queue
+	qlen = 128
 )
 
 const (
@@ -75,7 +77,7 @@ type (
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
 		recvbuf []byte
-		buffer  bytes.Buffer
+		bufptr  []byte
 		// extended output buffer(with header)
 		ext []byte
 
@@ -91,6 +93,7 @@ type (
 		updateInterval time.Duration // interval in seconds to call kcp.flush()
 		ackNoDelay     bool          // send ack immediately for each incoming packet
 		writeDelay     bool          // delay kcp.flush() for Write() for bulk transfer
+		dup            int           // duplicate udp packets
 
 		// notifications
 		die          chan struct{} // notify session has Closed
@@ -122,7 +125,6 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.l = l
 	sess.block = block
 	sess.recvbuf = make([]byte, mtuLimit)
-	sess.ext = make([]byte, mtuLimit)
 
 	// FEC initialization
 	sess.fecDecoder = newFECDecoder(rxFECMulti*(dataShards+parityShards), dataShards, parityShards)
@@ -138,6 +140,12 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	}
 	if sess.fecEncoder != nil {
 		sess.headerSize += fecHeaderSizePlus2
+	}
+
+	// only allocate extended packet buffer
+	// when the extra header is required
+	if sess.headerSize > 0 {
+		sess.ext = make([]byte, mtuLimit)
 	}
 
 	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
@@ -166,12 +174,13 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	return sess
 }
 
-// Read implements net.Conn 只从kcp读好的队列中读取。
+// Read implements net.Conn
 func (s *UDPSession) Read(b []byte) (n int, err error) {
 	for {
 		s.mu.Lock()
-		if s.buffer.Len() > 0 { // copy from buffer into b //如果buff有, 直接从buff获取
-			n, _ = s.buffer.Read(b)
+		if len(s.bufptr) > 0 { // copy from buffer into b
+			n = copy(b, s.bufptr)
+			s.bufptr = s.bufptr[n:]
 			s.mu.Unlock()
 			return n, nil
 		}
@@ -181,14 +190,7 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 			return 0, errors.New(errBrokenPipe)
 		}
 
-		if !s.rd.IsZero() { //读取超时
-			if time.Now().After(s.rd) { // read timeout
-				s.mu.Unlock()
-				return 0, errTimeout{}
-			}
-		}
-
-		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp  PeekSize流模式获取一片的大小，报文模式获取一个报文（包括多片）大小
+		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp
 			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
 			if len(b) >= size { // direct write to b
 				s.kcp.Recv(b)
@@ -196,21 +198,30 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 				return size, nil
 			}
 
-			if len(s.recvbuf) < size { // resize kcp receive buffer
+			// resize kcp receive buffer
+			// to make sure recvbuf has enough capacity
+			if cap(s.recvbuf) < size {
 				s.recvbuf = make([]byte, size)
 			}
+
+			// resize recvbuf slice length
+			s.recvbuf = s.recvbuf[:size]
 			s.kcp.Recv(s.recvbuf)
-			n = copy(b, s.recvbuf[:size])     // direct copy to b
-			s.buffer.Write(s.recvbuf[n:size]) // save rest bytes to bytes.Buffer  //多余的保存到  bytes.Buffer
+			n = copy(b, s.recvbuf)   // copy to b
+			s.bufptr = s.recvbuf[n:] // update pointer
 			s.mu.Unlock()
 			return n, nil
 		}
 
-
-		//kcp缓存里面也没有数据， 挂机超时在循环
+		// read deadline
 		var timeout *time.Timer
 		var c <-chan time.Time
-		if !s.rd.IsZero() { //rd是设置的超时时间
+		if !s.rd.IsZero() {
+			if time.Now().After(s.rd) {
+				s.mu.Unlock()
+				return 0, errTimeout{}
+			}
+
 			delay := s.rd.Sub(time.Now())
 			timeout = time.NewTimer(delay)
 			c = timeout.C
@@ -239,19 +250,12 @@ func (s *UDPSession) Write(b []byte) (n int, err error) {
 			return 0, errors.New(errBrokenPipe)
 		}
 
-		if !s.wd.IsZero() {
-			if time.Now().After(s.wd) { // write timeout
-				s.mu.Unlock()
-				return 0, errTimeout{}
-			}
-		}
-
-		// api flow control 滑动窗口控制
-		if s.kcp.WaitSnd() < int(s.kcp.Cwnd()) {
+		// api flow control
+		if s.kcp.WaitSnd() < int(s.kcp.snd_wnd) {
 			n = len(b)
 			for {
-				if len(b) <= int(s.kcp.mss) { //分包去send
-					s.kcp.Send(b) //send 只是把包放到 kcp.send_querue中 flush才是发送出去
+				if len(b) <= int(s.kcp.mss) {
+					s.kcp.Send(b)
 					break
 				} else {
 					s.kcp.Send(b[:s.kcp.mss])
@@ -259,17 +263,22 @@ func (s *UDPSession) Write(b []byte) (n int, err error) {
 				}
 			}
 
-			if !s.writeDelay { //每包 ack ???
-				s.kcp.flush(false)//立即发送
+			if !s.writeDelay {
+				s.kcp.flush(false)
 			}
 			s.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
 			return n, nil
 		}
 
+		// write deadline
 		var timeout *time.Timer
 		var c <-chan time.Time
 		if !s.wd.IsZero() {
+			if time.Now().After(s.wd) {
+				s.mu.Unlock()
+				return 0, errTimeout{}
+			}
 			delay := s.wd.Sub(time.Now())
 			timeout = time.NewTimer(delay)
 			c = timeout.C
@@ -385,6 +394,13 @@ func (s *UDPSession) SetACKNoDelay(nodelay bool) {
 	s.ackNoDelay = nodelay
 }
 
+// SetDUP duplicates udp packets for kcp output, for testing purpose only
+func (s *UDPSession) SetDUP(dup int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dup = dup
+}
+
 // SetNoDelay calls nodelay() of kcp
 func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.mu.Lock()
@@ -438,17 +454,18 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 // 2. CRC32
 // 3. Encryption
 // 4. WriteTo kernel
-
-// kcp.flush的回调函数。。 buf是kcp经过协议打包的数据
 func (s *UDPSession) output(buf []byte) {
 	var ecc [][]byte
 
 	// extend buf's header space
-	ext := s.ext[:s.headerSize+len(buf)]
-	copy(ext[s.headerSize:], buf)
+	ext := buf
+	if s.headerSize > 0 {
+		ext = s.ext[:s.headerSize+len(buf)]
+		copy(ext[s.headerSize:], buf)
+	}
 
 	// FEC stage
-	if s.fecEncoder != nil { // fec Forward Error Correction 前向纠错
+	if s.fecEncoder != nil {
 		ecc = s.fecEncoder.Encode(ext)
 	}
 
@@ -462,7 +479,7 @@ func (s *UDPSession) output(buf []byte) {
 		if ecc != nil {
 			for k := range ecc {
 				io.ReadFull(rand.Reader, ecc[k][:nonceSize])
-				checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:]) //校验和
+				checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
 				binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
 				s.block.Encrypt(ecc[k], ecc[k])
 			}
@@ -473,9 +490,11 @@ func (s *UDPSession) output(buf []byte) {
 	nbytes := 0
 	npkts := 0
 	// if mrand.Intn(100) < 50 {
-	if n, err := s.conn.WriteTo(ext, s.remote); err == nil {
-		nbytes += n
-		npkts++
+	for i := 0; i < s.dup+1; i++ {
+		if n, err := s.conn.WriteTo(ext, s.remote); err == nil {
+			nbytes += n
+			npkts++
+		}
 	}
 	// }
 
@@ -495,7 +514,7 @@ func (s *UDPSession) output(buf []byte) {
 func (s *UDPSession) update() (interval time.Duration) {
 	s.mu.Lock()
 	s.kcp.flush(false)
-	if s.kcp.WaitSnd() < int(s.kcp.Cwnd()) {
+	if s.kcp.WaitSnd() < int(s.kcp.snd_wnd) {
 		s.notifyWriteEvent()
 	}
 	interval = s.updateInterval
@@ -522,7 +541,6 @@ func (s *UDPSession) notifyWriteEvent() {
 	}
 }
 
-//服务器读到原始的消息吗，分发函数
 func (s *UDPSession) kcpInput(data []byte) {
 	var kcpInErrors, fecErrs, fecRecovered, fecParityShards uint64
 
@@ -600,6 +618,7 @@ func (s *UDPSession) receiver(ch chan []byte) {
 			select {
 			case ch <- data[:n]:
 			case <-s.die:
+				return
 			}
 		} else if err != nil {
 			return
@@ -611,7 +630,7 @@ func (s *UDPSession) receiver(ch chan []byte) {
 
 // read loop for client session
 func (s *UDPSession) readLoop() {
-	chPacket := make(chan []byte)
+	chPacket := make(chan []byte, qlen)
 	go s.receiver(chPacket)
 
 	for {
@@ -669,17 +688,17 @@ type (
 )
 
 // monitor incoming data for all connections of server
-func (l *Listener) monitor() { //监听。
-	chPacket := make(chan inPacket)
-	go l.receiver(chPacket) //udp的readfrom 读取数据在分发到连接。
+func (l *Listener) monitor() {
+	chPacket := make(chan inPacket, qlen)
+	go l.receiver(chPacket)
 	for {
 		select {
 		case p := <-chPacket:
 			raw := p.data
 			data := p.data
-			from := p.from //地址
+			from := p.from
 			dataValid := false
-			if l.block != nil { //加密
+			if l.block != nil {
 				l.block.Decrypt(data, data)
 				data = data[nonceSize:]
 				checksum := crc32.ChecksumIEEE(data[crcSize:])
@@ -718,7 +737,7 @@ func (l *Listener) monitor() { //监听。
 							l.chAccepts <- s
 						}
 					}
-				} else { //分发到各自的链接上
+				} else {
 					s.kcpInput(data)
 				}
 			}
@@ -739,6 +758,7 @@ func (l *Listener) receiver(ch chan inPacket) {
 			select {
 			case ch <- inPacket{from, data[:n]}:
 			case <-l.die:
+				return
 			}
 		} else if err != nil {
 			return
@@ -820,10 +840,12 @@ func (l *Listener) Close() error {
 }
 
 // closeSession notify the listener that a session has closed
-func (l *Listener) closeSession(remote net.Addr) {
+func (l *Listener) closeSession(remote net.Addr) bool {
 	select {
 	case l.chSessionClosed <- remote:
+		return true
 	case <-l.die:
+		return false
 	}
 }
 
@@ -853,7 +875,6 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 }
 
 // ServeConn serves KCP protocol for a single packet connection.
-// 监听用的连接。
 func ServeConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*Listener, error) {
 	l := new(Listener)
 	l.conn = conn
